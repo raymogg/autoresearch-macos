@@ -125,8 +125,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        # Parallel attention + MLP (PaLM/GPT-J): single shared norm, one dependency
+        n = norm(x)
+        x = x + self.attn(n, ve, cos_sin, window_size) + self.mlp(n)
         return x
 
 
