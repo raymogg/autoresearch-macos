@@ -287,6 +287,13 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
+            if reduction == 'mean':
+                # z-loss: regularize the softmax partition function (PaLM/Chinchilla)
+                targets_flat = targets.view(-1)
+                lse = torch.logsumexp(logits.view(-1, logits.size(-1)), dim=-1)
+                valid = targets_flat != -1
+                z_loss = 1e-4 * (lse[valid] ** 2).mean()
+                loss = loss + z_loss
             return loss
         return logits
 
