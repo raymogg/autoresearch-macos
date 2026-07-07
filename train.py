@@ -99,12 +99,18 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # FLOP-matched SwiGLU: 3 matmuls of size n_embd*hidden vs ReLU^2's 2 of
+        # size n_embd*(4*n_embd). Match 3*hidden == 8*n_embd -> hidden ~= 8/3*n_embd,
+        # rounded to a multiple of (head_dim/8) for clean matmul alignment.
+        head_dim = config.n_embd // config.n_head
+        mult = max(1, head_dim // 8)
+        hidden = round(8 / 3 * config.n_embd / mult) * mult
+        self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, hidden, bias=False)
+        self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        x = F.silu(self.c_fc(x)) * self.c_fc2(x)
         x = self.c_proj(x)
         return x
 
@@ -160,6 +166,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_fc2.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
