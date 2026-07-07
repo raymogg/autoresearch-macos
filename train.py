@@ -105,11 +105,16 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.gate_channels = 32
+        self.mlp_gate = nn.Linear(self.gate_channels, 1, bias=False)
 
     def forward(self, x):
+        # Gated MLP output: input-dependent sigmoid gate (neutral 1.0 at init)
+        gate = 2 * torch.sigmoid(self.mlp_gate(x[..., :self.gate_channels]))
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
+        x = x * gate
         return x
 
 
@@ -176,6 +181,7 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
+            torch.nn.init.zeros_(block.mlp.mlp_gate.weight)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
