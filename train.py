@@ -51,11 +51,15 @@ def has_ve(layer_idx, n_layer):
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
+    # Partial rotary: only the first rot_dim channels carry positional phase,
+    # the remaining channels pass through unrotated (position-agnostic content).
+    rot_dim = cos.shape[-1] * 2
+    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+    d = rot_dim // 2
+    x1, x2 = x_rot[..., :d], x_rot[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+    return torch.cat([y1, y2, x_pass], 3)
 
 
 class CausalSelfAttention(nn.Module):
@@ -142,7 +146,7 @@ class GPT(nn.Module):
         })
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim // 2)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -173,7 +177,7 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim // 2)
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
