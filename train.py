@@ -91,7 +91,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size, softcap=30.0)
         # Gated attention: input-dependent per-head sigmoid gate (neutral 1.0 at init)
         gate = 2 * torch.sigmoid(self.attn_gate(x[..., :self.ve_gate_channels]))
         y = y * gate.unsqueeze(-1)
