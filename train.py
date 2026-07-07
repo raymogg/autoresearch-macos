@@ -106,7 +106,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.gate_channels = 32
-        self.mlp_gate = nn.Linear(self.gate_channels, 1, bias=False)
+        self.mlp_gate = nn.Linear(self.gate_channels, config.n_embd, bias=False)
 
     def forward(self, x):
         # Gated MLP output: input-dependent sigmoid gate (neutral 1.0 at init)
