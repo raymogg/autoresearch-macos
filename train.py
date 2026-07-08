@@ -512,7 +512,8 @@ optimizer = model.setup_optimizer(
 )
 
 import torch._inductor.config as ind_cfg
-ind_cfg.coordinate_descent_tuning = True  # bounded local hill-climb; check_all_directions stays False
+ind_cfg.coordinate_descent_tuning = True  # bounded local hill-climb
+ind_cfg.coordinate_descent_check_all_directions = True  # search all neighbor dirs per coord (compile-time only)
 model = torch.compile(model, mode='max-autotune-no-cudagraphs', dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
