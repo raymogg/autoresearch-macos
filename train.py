@@ -133,8 +133,9 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # +1 slot for the weight-shared extra depth pass (universal-transformer loop)
+        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer + 1))
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer + 1))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -282,6 +283,12 @@ class GPT(nn.Module):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
+        # Weight-shared extra depth: re-apply the deepest block once more
+        # (universal-transformer loop) at zero new matrix params.
+        last_idx = self.config.n_layer - 1
+        x = self.resid_lambdas[self.config.n_layer] * x + self.x0_lambdas[self.config.n_layer] * x0
+        ve = self.value_embeds[str(last_idx)](idx) if str(last_idx) in self.value_embeds else None
+        x = self.transformer.h[last_idx](x, ve, cos_sin, self.window_sizes[last_idx])
         x = norm(x)
 
         softcap = 15
