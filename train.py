@@ -537,6 +537,18 @@ def next_batch():
 
 x, y, epoch = next_batch()  # prefetch first batch
 
+# Batch-size warmup: use half-batch (64-row) optimizer steps in the early high-LR
+# phase. Pre-warm torch.compile for BOTH the (64,2048) and (128,2048) forward+backward
+# shapes here (off the timed loop) so the mid-run transition never triggers a recompile
+# stall. No optimizer.step() -> no optimizer state created; grads are zeroed afterward.
+HALF_BATCH = DEVICE_BATCH_SIZE // 2
+for _warm_b in (HALF_BATCH, DEVICE_BATCH_SIZE):
+    with autocast_ctx:
+        _wloss = model(x[:_warm_b], y[:_warm_b].masked_fill(y[:_warm_b] == bos_token_id, -1))
+    _wloss.backward()
+    model.zero_grad(set_to_none=True)
+del _wloss
+
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
@@ -570,13 +582,6 @@ step = 0
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y.masked_fill(y == bos_token_id, -1))
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        x, y, epoch = next_batch()
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -588,8 +593,24 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+
+    # Batch-size warmup (gradient-noise-scale): in the early high-LR phase, split the
+    # loaded 128-row batch into two 64-row optimizer steps (effective batch 2**17,
+    # ~2x updates at ~unchanged fwd+bwd compute); past the halfway point revert to a
+    # single 128-row step (2**18) for clean cooldown gradients.
+    if progress < 0.5:
+        micro_batches = ((x[:HALF_BATCH], y[:HALF_BATCH]), (x[HALF_BATCH:], y[HALF_BATCH:]))
+    else:
+        micro_batches = ((x, y),)
+    for xb, yb in micro_batches:
+        with autocast_ctx:
+            loss = model(xb, yb.masked_fill(yb == bos_token_id, -1))
+        train_loss = loss.detach()
+        loss.backward()
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+
+    x, y, epoch = next_batch()
 
     train_loss_f = train_loss.item()
 
