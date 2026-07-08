@@ -452,6 +452,8 @@ WARMDOWN_RATIO = 0.7    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 SWA_START = 0.85        # progress at which the LR plateau + SWA averaging begins
 SWA_LR_FRAC = 0.2       # plateau LR as fraction of peak during the SWA window
+LOOKAHEAD_K = 5         # Lookahead sync period (Muon matrix params only)
+LOOKAHEAD_ALPHA = 0.5   # Lookahead interpolation rate toward fast weights
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -578,6 +580,14 @@ step = 0
 swa_params = None
 swa_count = 0
 
+# Lookahead over Muon matrix params only: keep an fp32 slow-weight copy and
+# periodically pull it toward the fast weights, then reset the fast weights onto
+# it. Muon's spectral-normed updates are constant-magnitude and oscillate near a
+# basin; centering damps that oscillation. Active only before the SWA plateau,
+# so it never perturbs the eval-time SWA average.
+lookahead_params = list(model.transformer.h.parameters())
+slow_params = [p.detach().float().clone() for p in lookahead_params]
+
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
@@ -601,6 +611,13 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+
+    # Lookahead: every k steps, pull slow weights toward fast, reset fast to slow.
+    if progress < SWA_START and (step + 1) % LOOKAHEAD_K == 0:
+        with torch.no_grad():
+            for slow, p in zip(slow_params, lookahead_params):
+                slow.add_(p.detach().float() - slow, alpha=LOOKAHEAD_ALPHA)
+                p.copy_(slow.to(p.dtype))
 
     # SWA: accumulate a uniform running average of weights across the plateau.
     if progress >= SWA_START:
