@@ -111,11 +111,44 @@ class MLP(nn.Module):
         return x
 
 
+class MoEMLP(nn.Module):
+    """Expert-choice MoE MLP: fixed capacity per expert => fully static shapes.
+    Each of `num_experts` experts selects its top-C tokens (C = B*T/num_experts,
+    capacity_factor=1.0) so total tokens processed == dense MLP (iso-FLOP) while
+    holding num_experts x the parameters. Dropped tokens keep only the residual."""
+    def __init__(self, config, num_experts=4):
+        super().__init__()
+        self.num_experts = num_experts
+        hidden = 4 * config.n_embd
+        self.router = nn.Linear(config.n_embd, num_experts, bias=False)
+        # Stacked expert weights in nn.Linear (out, in) orientation for Muon parity.
+        self.c_fc = nn.Parameter(torch.empty(num_experts, hidden, config.n_embd))
+        self.c_proj = nn.Parameter(torch.empty(num_experts, config.n_embd, hidden))
+
+    def forward(self, x):
+        B, T, D = x.size()
+        N = B * T
+        x = x.reshape(N, D)
+        capacity = N // self.num_experts
+        logits = self.router(x)                                        # (N, E)
+        gate = torch.sigmoid(logits)                                   # (N, E)
+        _, topi = torch.topk(logits.transpose(0, 1), capacity, dim=1)  # (E, C)
+        xe = x[topi]                                                   # (E, C, D)
+        h = torch.bmm(xe, self.c_fc.mT)                                # (E, C, H)
+        h = F.relu(h).square()
+        oe = torch.bmm(h, self.c_proj.mT)                              # (E, C, D)
+        g = torch.gather(gate.transpose(0, 1), 1, topi).unsqueeze(-1)  # (E, C, 1)
+        oe = oe * g
+        out = torch.zeros(N, D, dtype=oe.dtype, device=oe.device)
+        out.index_add_(0, topi.reshape(-1), oe.reshape(-1, D))
+        return out.reshape(B, T, D)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MoEMLP(config) if layer_idx == config.n_layer - 1 else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
@@ -161,8 +194,13 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if isinstance(block.mlp, MoEMLP):
+                torch.nn.init.uniform_(block.mlp.c_fc, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj)
+                torch.nn.init.zeros_(block.mlp.router.weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
@@ -406,10 +444,11 @@ class MuonAdamW(torch.optim.Optimizer):
         shape, device, dtype = p.shape, p.device, p.dtype
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
+        if "second_momentum_buffer" not in state:
+            state_shape = list((num_params,) + tuple(shape))
+            state_shape[red_dim] = 1
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
         self._muon_momentum_t.fill_(group["momentum"])
