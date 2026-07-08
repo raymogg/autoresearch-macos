@@ -567,6 +567,12 @@ smooth_train_loss = 0
 total_training_time = 0
 step = 0
 
+# Weight EMA (tail/Polyak averaging): evaluate an average of the low-LR cooldown
+# iterates instead of the noisy final point. fp32 shadow to keep small updates.
+EMA_DECAY = 0.99
+ema_param_list = list(model.parameters())
+ema_shadow = [p.detach().float().clone() for p in ema_param_list]
+
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
@@ -590,6 +596,12 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+
+    # EMA update over the live parameters (fp32 accumulation).
+    with torch.no_grad():
+        torch._foreach_mul_(ema_shadow, EMA_DECAY)
+        torch._foreach_add_(ema_shadow, [p.detach().float() for p in ema_param_list],
+                            alpha=1 - EMA_DECAY)
 
     train_loss_f = train_loss.item()
 
@@ -634,8 +646,11 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-# Final eval
+# Final eval on the EMA-averaged weights (swap shadow into live params).
 model.eval()
+with torch.no_grad():
+    for p, e in zip(ema_param_list, ema_shadow):
+        p.copy_(e)
 with autocast_ctx:
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
