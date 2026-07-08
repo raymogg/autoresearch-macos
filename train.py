@@ -253,7 +253,7 @@ class GPT(nn.Module):
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0, is_lm_head=True),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
@@ -450,6 +450,7 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.7    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+LM_HEAD_FINAL_LR_FRAC = 0.3  # lm_head decays to this floor (slowest group, still underfit at run-end)
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -540,14 +541,14 @@ print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
-def get_lr_multiplier(progress):
+def get_lr_multiplier(progress, final_lr_frac=FINAL_LR_FRAC):
     if progress < WARMUP_RATIO:
         return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
     elif progress < 1.0 - WARMDOWN_RATIO:
         return 1.0
     else:
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        return cooldown * 1.0 + (1 - cooldown) * final_lr_frac
 
 def get_muon_momentum(step):
     frac = min(step / 300, 1)
@@ -579,10 +580,11 @@ while True:
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
+    lrm_lm_head = get_lr_multiplier(progress, LM_HEAD_FINAL_LR_FRAC)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+        group["lr"] = group["initial_lr"] * (lrm_lm_head if group.get("is_lm_head") else lrm)
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
