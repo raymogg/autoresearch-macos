@@ -550,9 +550,10 @@ def get_lr_multiplier(progress):
     elif progress < 1.0 - WARMDOWN_RATIO:
         return 1.0
     elif progress < SWA_START:
-        # Linear cooldown from peak down to the SWA plateau floor.
+        # 1-sqrt cooldown from peak down to the SWA plateau floor: anneals fast
+        # early then lingers at low LR (WSD-literature-preferred shape).
         frac = (progress - (1.0 - WARMDOWN_RATIO)) / (SWA_START - (1.0 - WARMDOWN_RATIO))
-        return 1.0 * (1 - frac) + SWA_LR_FRAC * frac
+        return SWA_LR_FRAC + (1.0 - SWA_LR_FRAC) * (1.0 - frac**0.5)
     else:
         # Constant low-LR plateau: iterates oscillate around the basin so the
         # uniform SWA average of these weights sits at the basin center.
