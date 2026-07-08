@@ -164,7 +164,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
+        self.resid_lambdas.fill_(1.1)
         self.x0_lambdas.fill_(0.1)
         # Value embeddings: embedding-scale init (std=1.0) to match wte and the
         # un-normed v-pathway RMS, not the transformer-matrix std (n_embd^-0.5).
