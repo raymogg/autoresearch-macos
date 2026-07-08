@@ -464,6 +464,7 @@ H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
+bos_token_id = tokenizer.get_bos_token_id()
 print(f"Vocab size: {vocab_size:,}")
 
 def build_model_config(depth):
@@ -545,7 +546,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y.masked_fill(y == bos_token_id, -1))
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
