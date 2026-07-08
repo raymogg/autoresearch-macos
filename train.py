@@ -116,10 +116,14 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        # LayerNorm Scaling (Sun et al. 2025, "The Curse of Depth in LLMs"):
+        # scale pre-branch norm outputs by 1/sqrt(layer_idx+1) to control the
+        # depth-wise variance growth of Pre-LN residual streams.
+        self.ln_scale = (layer_idx + 1) ** -0.5
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        x = x + self.attn(self.ln_scale * norm(x), ve, cos_sin, window_size)
+        x = x + self.mlp(self.ln_scale * norm(x))
         return x
 
 
