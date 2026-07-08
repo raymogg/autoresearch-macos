@@ -285,8 +285,11 @@ class GPT(nn.Module):
         x = norm(x)
 
         softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
+        # Compute the logit projection in fp32/tf32 (lm_head.weight is stored
+        # fp32) instead of bf16 autocast, so the 8192-way logits are not rounded
+        # to 7-bit mantissa before the softmax/CE interface.
+        with torch.autocast(device_type="cuda", enabled=False):
+            logits = self.lm_head(x.float())
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
