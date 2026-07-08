@@ -162,7 +162,10 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            # Warm c_proj off zero so c_fc receives gradient from step 1 (zero-init
+            # freezes the c_fc gradient path); half the fan-in variance-preserving scale.
+            s2 = 0.5 * 3**0.5 * (4 * n_embd)**-0.5
+            torch.nn.init.uniform_(block.mlp.c_proj.weight, -s2, s2)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
