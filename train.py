@@ -106,7 +106,10 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        # Fixed leaky squared-ReLU: keep strong positive curvature, restore a
+        # small mirrored negative branch for negative-side gradient (dead-unit
+        # revival) and sign expressiveness. Zero params, zero extra FLOPs.
+        x = torch.where(x > 0, x * x, -0.1 * x * x)
         x = self.c_proj(x)
         return x
 
