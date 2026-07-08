@@ -117,9 +117,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, attn_gain, mlp_gain):
+        x = x + attn_gain * self.attn(norm(x), ve, cos_sin, window_size)
+        x = x + mlp_gain * self.mlp(norm(x))
         return x
 
 
@@ -135,6 +135,11 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # Learnable per-branch residual gains (LayerScale-style), one per attn/mlp
+        # branch. Trained by fast Adam so branch magnitude ramps quicker than Muon
+        # grows the zero-init c_proj norm.
+        self.attn_gains = nn.Parameter(torch.ones(config.n_layer))
+        self.mlp_gains = nn.Parameter(torch.ones(config.n_layer))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -166,6 +171,8 @@ class GPT(nn.Module):
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+        self.attn_gains.fill_(1.0)
+        self.mlp_gains.fill_(1.0)
         # Value embeddings: embedding-scale init (std=1.0) to match wte and the
         # un-normed v-pathway RMS, not the transformer-matrix std (n_embd^-0.5).
         ve_bound = 3**0.5 * 1.4  # uniform(-sqrt(3)*1.4, +) has std 1.4
@@ -247,8 +254,10 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
+        gain_params = [self.attn_gains, self.mlp_gains]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
+            len(gain_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -258,6 +267,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=gain_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -281,7 +291,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            x = block(x, ve, cos_sin, self.window_sizes[i], self.attn_gains[i], self.mlp_gains[i])
         x = norm(x)
 
         softcap = 15
