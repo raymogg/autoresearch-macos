@@ -287,8 +287,17 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+            logits_flat = logits.view(-1, logits.size(-1))
+            targets_flat = targets.view(-1)
+            loss = F.cross_entropy(logits_flat, targets_flat,
                                    ignore_index=-1, reduction=reduction)
+            if reduction != 'none':
+                # PaLM-style z-loss: condition the softmax log-partition (Z),
+                # masked to the same valid positions as CE. Training-only;
+                # eval uses reduction='none' and is left untouched.
+                valid = targets_flat != -1
+                zloss = 1e-4 * logits_flat.logsumexp(dim=-1).pow(2)[valid].mean()
+                loss = loss + zloss
             return loss
         return logits
 
