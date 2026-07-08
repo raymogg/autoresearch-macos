@@ -52,12 +52,17 @@ def has_ve(layer_idx, n_layer):
 
 
 def apply_rotary_emb(x, cos, sin):
+    # Partial rotary: rotate only the first head_dim//2 channels (the split-half
+    # pairs covered by cos/sin), leaving the remaining channels rotation-free as a
+    # distance-invariant (NoPE) content-matching subspace.
     assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
+    d = x.shape[3] // 2      # boundary of the split-half layout
+    r = cos.shape[-1]        # number of rotated freq pairs (head_dim//4)
+    x1, x2 = x[..., :r], x[..., d:d + r]           # rotated pairs
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+    xr1, xr2 = x[..., r:d], x[..., d + r:]          # rotation-free channels
+    return torch.cat([y1, xr1, y2, xr2], 3)
 
 
 class CausalSelfAttention(nn.Module):
@@ -187,8 +192,9 @@ class GPT(nn.Module):
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
             device = self.transformer.wte.weight.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        rot_dim = head_dim // 2  # partial rotary: only half the channels are rotated
+        channel_range = torch.arange(0, rot_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base ** (channel_range / rot_dim))
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
