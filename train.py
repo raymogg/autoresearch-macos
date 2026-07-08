@@ -201,7 +201,7 @@ class GPT(nn.Module):
         assert all(c in "SL" for c in pattern)
         full_context = config.sequence_len
         long_window = full_context // 2   # global-ish "L" layers: half context (cuts FLOPs + cross-doc leakage)
-        short_window = full_context // 16  # local "S" layers: 128 (unchanged)
+        short_window = full_context // 8  # local "S" layers: 256 (widened medium-range receptive field)
         char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
         window_sizes = []
         for layer_idx in range(config.n_layer):
