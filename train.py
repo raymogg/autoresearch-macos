@@ -133,6 +133,8 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Auxiliary multi-token-prediction head: predicts token t+2 (training only).
+        self.lm_head2 = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -153,6 +155,7 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.lm_head2.weight, mean=0.0, std=0.02)
         # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
@@ -229,7 +232,7 @@ class GPT(nn.Module):
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        lm_head = sum(p.numel() for p in self.lm_head.parameters()) + sum(p.numel() for p in self.lm_head2.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
@@ -244,7 +247,7 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        lm_head_params = list(self.lm_head.parameters()) + list(self.lm_head2.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
@@ -270,7 +273,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, reduction='mean'):
+    def forward(self, idx, targets=None, reduction='mean', aux_targets=None):
         B, T = idx.size()
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -292,6 +295,16 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
+            if aux_targets is not None:
+                # Auxiliary multi-token-prediction: predict token t+2 from the
+                # same final hidden state (training only). Densifies the gradient.
+                aux_logits = self.lm_head2(x)
+                aux_logits = aux_logits.float()
+                aux_logits = softcap * torch.tanh(aux_logits / softcap)
+                aux_loss = F.cross_entropy(aux_logits.view(-1, aux_logits.size(-1)),
+                                           aux_targets.view(-1),
+                                           ignore_index=-1, reduction=reduction)
+                loss = loss + 0.15 * aux_loss
             return loss
         return logits
 
@@ -582,8 +595,13 @@ while True:
     torch.cuda.synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        # Auxiliary multi-token-prediction targets: token t+2 is y shifted left by
+        # one; last column has no t+2 target (set to -1). Mask bos boundaries too.
+        aux_y = torch.full_like(y, -1)
+        aux_y[:, :-1] = y[:, 1:]
+        aux_y = aux_y.masked_fill(aux_y == bos_token_id, -1)
         with autocast_ctx:
-            loss = model(x, y.masked_fill(y == bos_token_id, -1))
+            loss = model(x, y.masked_fill(y == bos_token_id, -1), aux_targets=aux_y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
