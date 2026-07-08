@@ -11,6 +11,8 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import gc
 import math
 import time
+import queue
+import threading
 from dataclasses import dataclass, asdict
 
 import torch
@@ -509,7 +511,24 @@ optimizer = model.setup_optimizer(
 model = torch.compile(model, mode='max-autotune-no-cudagraphs', dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
+
+# Background prefetch thread: overlap the loader's pure-Python best-fit packing
+# with GPU compute. The loader reuses a shared gpu_buffer and yields views into
+# it, so we clone the tensors on the producer thread (preserving default-stream
+# ordering) before enqueuing to remove aliasing. Single producer => data order
+# is unchanged (bit-identical training).
+_prefetch_queue = queue.Queue(maxsize=2)
+
+def _prefetch_worker():
+    for xb, yb, ep in train_loader:
+        _prefetch_queue.put((xb.clone(), yb.clone(), ep))
+
+threading.Thread(target=_prefetch_worker, daemon=True).start()
+
+def next_batch():
+    return _prefetch_queue.get()
+
+x, y, epoch = next_batch()  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
@@ -550,7 +569,7 @@ while True:
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
-        x, y, epoch = next(train_loader)
+        x, y, epoch = next_batch()
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
