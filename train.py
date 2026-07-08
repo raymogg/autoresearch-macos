@@ -292,6 +292,15 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
+            if reduction == 'mean':
+                # Auxiliary z-loss: pin the softmax log-partition near zero to reduce
+                # logit drift. Computed from in-memory logits (no extra GEMM).
+                Z_COEF = 1e-4
+                targets_flat = targets.view(-1)
+                lse = torch.logsumexp(logits.view(-1, logits.size(-1)), dim=-1)
+                valid = targets_flat != -1
+                z_loss = (lse.square() * valid).sum() / valid.sum().clamp_min(1)
+                loss = loss + Z_COEF * z_loss
             return loss
         return logits
 
