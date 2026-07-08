@@ -168,7 +168,7 @@ class GPT(nn.Module):
         self.x0_lambdas.fill_(0.1)
         # Value embeddings: embedding-scale init (std=1.0) to match wte and the
         # un-normed v-pathway RMS, not the transformer-matrix std (n_embd^-0.5).
-        ve_bound = 3**0.5 * 1.4  # uniform(-sqrt(3)*1.4, +) has std 1.4
+        ve_bound = 3**0.5 * 1.6  # uniform(-sqrt(3)*1.6, +) has std 1.6
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -ve_bound, ve_bound)
         # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
