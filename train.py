@@ -314,9 +314,13 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    mhat = exp_avg / bias1
+    vhat = exp_avg_sq / bias2
+    # Adam-atan2: bounded, scale-invariant per-coordinate update. 4/pi calibrates
+    # a typical |m|~sqrt(v) coordinate to a bit-identical unit step while capping
+    # outlier sparse-embedding updates (near-zero vhat) at a*pi/2 = 2.0.
+    step_size = lr_t * (4.0 / math.pi)
+    p.add_(torch.atan2(mhat, vhat.sqrt()), alpha=-step_size)
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
