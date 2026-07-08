@@ -505,6 +505,9 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
+import torch._inductor.config as ind_cfg
+ind_cfg.coordinate_descent_tuning = True
+ind_cfg.coordinate_descent_check_all_directions = True
 model = torch.compile(model, mode='max-autotune-no-cudagraphs', dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
