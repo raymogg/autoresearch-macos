@@ -450,7 +450,8 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.7    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
-SWA_START = 0.85        # progress at which the LR plateau + SWA averaging begins
+SWA_START = 0.85        # progress at which the LR plateau begins
+SWA_AVG_START = 0.75    # progress at which SWA weight averaging begins (decoupled from plateau)
 SWA_LR_FRAC = 0.2       # plateau LR as fraction of peak during the SWA window
 
 # Model size
@@ -604,7 +605,10 @@ while True:
     model.zero_grad(set_to_none=True)
 
     # SWA: accumulate a uniform running average of weights across the plateau.
-    if progress >= SWA_START:
+    # Averaging starts earlier than the LR plateau: the 1-sqrt cooldown already
+    # flattens LR to ~0.24-0.28x over [SWA_AVG_START, SWA_START], so those
+    # near-basin iterates are folded into the mean (LR schedule unchanged).
+    if progress >= SWA_AVG_START:
         with torch.no_grad():
             params = list(model.parameters())
             if swa_params is None:
