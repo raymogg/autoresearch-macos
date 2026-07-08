@@ -316,7 +316,13 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     bias2 = 1 - beta2_t ** step_t
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    # Cautious update: mask out coordinates whose update disagrees in sign with
+    # the current gradient (stale momentum pushing against the fresh gradient),
+    # then rescale survivors to preserve the mean step magnitude.
+    u = exp_avg / denom
+    mask = (u * grad > 0).to(u.dtype)
+    mask = mask * (mask.numel() / mask.sum().clamp_min(1.0))
+    p.add_(u * mask, alpha=-step_size)
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
