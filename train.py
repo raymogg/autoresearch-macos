@@ -259,10 +259,20 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # Mean-preserving per-layer Muon LR profile: linear ramp over depth, mean 1.0.
+        # Layer 0 -> (1-alpha)x, last layer -> (1+alpha)x. Pure depth PROFILE, not a
+        # global LR change (mean multiplier is exactly 1.0).
+        n_layer = self.config.n_layer
+        alpha = 0.3
+        param_layer = {p: l for l, block in enumerate(self.transformer.h) for p in block.parameters()}
+        def layer_mult(l):
+            return 1.0 + alpha * (2.0 * l / (n_layer - 1) - 1.0) if n_layer > 1 else 1.0
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
+            lr_scale = torch.tensor([layer_mult(param_layer[p]) for p in group_params],
+                                    dtype=torch.float32, device=group_params[0].device).view(-1, 1, 1)
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
+                kind='muon', params=group_params, lr=matrix_lr, lr_scale=lr_scale,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
         optimizer = MuonAdamW(param_groups)
@@ -320,7 +330,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+                    momentum_t, lr_t, lr_scale_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
@@ -351,8 +361,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
+    # Cautious weight decay + parameter update (per-layer LR profile via lr_scale_t)
+    lr = lr_t.to(g.dtype) * lr_scale_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
@@ -418,7 +428,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t.fill_(group["weight_decay"])
         muon_step_fused(stacked_grads, stacked_params,
                         state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                        self._muon_momentum_t, self._muon_lr_t, group["lr_scale"], self._muon_wd_t,
                         self._muon_beta2_t, group["ns_steps"], red_dim)
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
