@@ -132,7 +132,9 @@ class GPT(nn.Module):
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head_rank = 256
+        self.lm_head_down = nn.Linear(config.n_embd, self.lm_head_rank, bias=False)
+        self.lm_head_up = nn.Linear(self.lm_head_rank, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -152,7 +154,11 @@ class GPT(nn.Module):
     def init_weights(self):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+        # Low-rank lm_head: pick down/up std so initial logit RMS matches the
+        # tuned full-rank std=0.02 (var_logit = n_embd*rank*down_std^2*up_std^2).
+        lm_head_std = (0.02**2 / self.lm_head_rank) ** 0.25
+        torch.nn.init.normal_(self.lm_head_down.weight, mean=0.0, std=lm_head_std)
+        torch.nn.init.normal_(self.lm_head_up.weight, mean=0.0, std=lm_head_std)
         # Transformer blocks
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
@@ -229,7 +235,8 @@ class GPT(nn.Module):
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        lm_head = sum(p.numel() for p in self.lm_head_down.parameters()) + \
+                  sum(p.numel() for p in self.lm_head_up.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
@@ -244,7 +251,7 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        lm_head_params = list(self.lm_head_down.parameters()) + list(self.lm_head_up.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
@@ -285,7 +292,7 @@ class GPT(nn.Module):
         x = norm(x)
 
         softcap = 15
-        logits = self.lm_head(x)
+        logits = self.lm_head_up(self.lm_head_down(x))
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
 
