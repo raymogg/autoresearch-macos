@@ -197,15 +197,17 @@ class GPT(nn.Module):
         return cos, sin
 
     def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
+        # Graduated, depth-increasing sliding-window schedule (receptive field grows
+        # with depth). Fractions of full context, doubling every ~2 layers; last layer
+        # is full context. Iso-Sum(window) with the prior binary SSSL pattern.
         long_window = config.sequence_len
-        short_window = long_window // 16
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+        base = long_window // 16  # 128 at seq_len=2048
+        n = config.n_layer
         window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
+        for layer_idx in range(n):
+            mult = 2 ** (layer_idx // 2)  # 1,1,2,2,4,4,8,8,...
+            window = min(base * mult, long_window)
+            window_sizes.append((window, 0))
         window_sizes[-1] = (long_window, 0)
         return window_sizes
 
