@@ -450,6 +450,8 @@ ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.7    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+SWA_START = 0.85        # progress at which the LR plateau + SWA averaging begins
+SWA_LR_FRAC = 0.2       # plateau LR as fraction of peak during the SWA window
 
 # Model size
 DEPTH = 8               # number of transformer layers
@@ -547,9 +549,14 @@ def get_lr_multiplier(progress):
         return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
     elif progress < 1.0 - WARMDOWN_RATIO:
         return 1.0
+    elif progress < SWA_START:
+        # Linear cooldown from peak down to the SWA plateau floor.
+        frac = (progress - (1.0 - WARMDOWN_RATIO)) / (SWA_START - (1.0 - WARMDOWN_RATIO))
+        return 1.0 * (1 - frac) + SWA_LR_FRAC * frac
     else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        # Constant low-LR plateau: iterates oscillate around the basin so the
+        # uniform SWA average of these weights sits at the basin center.
+        return SWA_LR_FRAC
 
 def get_muon_momentum(step):
     frac = min(step / 300, 1)
@@ -566,6 +573,10 @@ t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
 step = 0
+
+# SWA: uniform running average of all parameters over the final LR plateau.
+swa_params = None
+swa_count = 0
 
 while True:
     torch.cuda.synchronize()
@@ -590,6 +601,18 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+
+    # SWA: accumulate a uniform running average of weights across the plateau.
+    if progress >= SWA_START:
+        with torch.no_grad():
+            params = list(model.parameters())
+            if swa_params is None:
+                swa_params = [p.detach().float().clone() for p in params]
+                swa_count = 1
+            else:
+                swa_count += 1
+                for avg, p in zip(swa_params, params):
+                    avg.add_(p.detach().float() - avg, alpha=1.0 / swa_count)
 
     train_loss_f = train_loss.item()
 
@@ -633,6 +656,14 @@ while True:
 print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
+
+# Swap in the SWA-averaged weights for the final eval (eval is the last op,
+# so no restore is needed).
+if swa_params is not None:
+    with torch.no_grad():
+        for p, avg in zip(model.parameters(), swa_params):
+            p.copy_(avg.to(p.dtype))
+    print(f"Loaded SWA average over {swa_count} plateau steps")
 
 # Final eval
 model.eval()
