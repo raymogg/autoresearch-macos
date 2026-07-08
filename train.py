@@ -560,9 +560,14 @@ smooth_train_loss = 0
 total_training_time = 0
 step = 0
 
+# Batch the CPU<->GPU synchronization, loss readback, timing and logging to
+# once every SYNC_EVERY steps. This lets the CPU run ahead (bounded by the
+# maxsize=2 prefetch queue for backpressure) and hide per-step kernel-launch /
+# optimizer-Python bubbles. Per-step math is unchanged.
+SYNC_EVERY = 8
+t_window_start = time.time()
+
 while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y.masked_fill(y == bos_token_id, -1))
@@ -571,7 +576,7 @@ while True:
         loss.backward()
         x, y, epoch = next_batch()
 
-    # Progress and schedules
+    # Progress and schedules (updated every step)
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
@@ -584,31 +589,6 @@ while True:
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
-    train_loss_f = train_loss.item()
-
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
-
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-
-    if step > 10:
-        total_training_time += dt
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
-
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
-
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
         gc.collect()
@@ -619,9 +599,40 @@ while True:
 
     step += 1
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
+    # Periodic sync point: synchronize, read loss, measure elapsed wall time,
+    # log, and check the time budget once every SYNC_EVERY steps.
+    if step % SYNC_EVERY == 0:
+        torch.cuda.synchronize()
+        t_now = time.time()
+        window_elapsed = t_now - t_window_start
+        t_window_start = t_now
+        dt = window_elapsed / SYNC_EVERY
+
+        # Skip warmup window so we don't count compilation
+        if step > 10:
+            total_training_time += window_elapsed
+
+        train_loss_f = train_loss.item()
+
+        # Fast fail: abort if loss is exploding or NaN
+        if math.isnan(train_loss_f) or train_loss_f > 100:
+            print("FAIL")
+            exit(1)
+
+        # Logging
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step // SYNC_EVERY))
+        pct_done = 100 * progress
+        tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+        mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+        remaining = max(0, TIME_BUDGET - total_training_time)
+
+        print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+        # Time's up — but only stop after warmup steps so we don't count compilation
+        if step > 10 and total_training_time >= TIME_BUDGET:
+            break
 
 print()  # newline after \r training log
 
