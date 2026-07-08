@@ -128,9 +128,19 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
+        # Weight-share the two deepest blocks: build one shared Block (as the
+        # last/ve layer so it carries a ve_gate) and reuse it at both layer
+        # indices n_layer-2 and n_layer-1. Throughput-neutral (same 8 forward
+        # passes / FLOPs); parameters() dedupes so the shared tensors are
+        # registered/optimized once. Layer n_layer-2 passes ve=None (handled by
+        # attn.forward); per-layer scalars, value_embeds, windows stay distinct.
+        h_blocks = [Block(config, i) for i in range(config.n_layer)]
+        shared_deep = Block(config, config.n_layer - 1)
+        h_blocks[config.n_layer - 2] = shared_deep
+        h_blocks[config.n_layer - 1] = shared_deep
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList(h_blocks),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
