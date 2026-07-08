@@ -559,7 +559,12 @@ def get_lr_multiplier(progress):
         # uniform SWA average of these weights sits at the basin center.
         return SWA_LR_FRAC
 
-def get_muon_momentum(step):
+def get_muon_momentum(step, progress):
+    # Decorrelate SWA-plateau iterates: drop Muon momentum during the plateau so
+    # consecutive averaged weights have a shorter smoothing horizon (~5 vs ~20
+    # steps), lowering variance-of-the-mean for the uniform SWA average.
+    if progress >= SWA_START:
+        return 0.80
     frac = min(step / 300, 1)
     return (1 - frac) * 0.85 + frac * 0.95
 
@@ -593,7 +598,7 @@ while True:
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
+    muon_momentum = get_muon_momentum(step, progress)
     muon_weight_decay = get_weight_decay(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
