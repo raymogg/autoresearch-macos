@@ -101,12 +101,17 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # Matched-FLOP single-fused ReLU^2-GLU: hidden h = 8/3 * n_embd keeps
+        # 3*n_embd*h == 2*n_embd*(4*n_embd), so FFN params/FLOPs equal the dense
+        # 4x squared-ReLU MLP. One fused input GEMM (n_embd -> 2h) is split into
+        # gate and value; dims are 256-aligned for 768 (h=2048, 2h=4096).
+        hidden = 8 * config.n_embd // 3
+        self.c_fc = nn.Linear(config.n_embd, 2 * hidden, bias=False)
+        self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        g, v = self.c_fc(x).chunk(2, dim=-1)
+        x = F.relu(g).square() * v
         x = self.c_proj(x)
         return x
 
