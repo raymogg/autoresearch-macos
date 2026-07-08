@@ -569,7 +569,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y.masked_fill(y == bos_token_id, -1))
+            loss = model(x, y.masked_fill((y == bos_token_id) | (x == bos_token_id), -1))
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
