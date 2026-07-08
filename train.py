@@ -66,6 +66,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
+        self.sequence_len = config.sequence_len
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
@@ -92,7 +93,11 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, softmax_scale=0.12, causal=True, window_size=window_size)
+        # Decouple attention temperature by window type: local (short-window) layers
+        # see few keys and benefit from a sharper softmax; full-context layers keep 0.12
+        # to avoid over-collapsing broad aggregation (uniform 0.15 regressed).
+        softmax_scale = 0.12 if window_size[0] >= self.sequence_len else 0.15
+        y = fa3.flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
