@@ -111,11 +111,48 @@ class MLP(nn.Module):
         return x
 
 
+class MoEMLP(nn.Module):
+    """Expert-choice MoE (capacity_factor=1.0). Each expert selects its top-C
+    tokens; per-step matmul FLOP ~ unchanged vs a dense MLP (C = tokens/E) while
+    the block gains E-fold parameters. Kept out of the compiled graph via
+    torch.compiler.disable so inductor never autotunes topk/gather/bmm/scatter."""
+
+    def __init__(self, config, n_experts=4):
+        super().__init__()
+        self.n_experts = n_experts
+        hidden = 4 * config.n_embd
+        self.router = nn.Linear(config.n_embd, n_experts, bias=False)
+        self.c_fc = nn.ModuleList([nn.Linear(config.n_embd, hidden, bias=False) for _ in range(n_experts)])
+        self.c_proj = nn.ModuleList([nn.Linear(hidden, config.n_embd, bias=False) for _ in range(n_experts)])
+
+    @torch.compiler.disable
+    def forward(self, x):
+        B, T, C = x.shape
+        E = self.n_experts
+        x_flat = x.reshape(B * T, C)
+        N = x_flat.size(0)
+        cap = N // E
+        logits = self.router(x_flat)              # [N, E]
+        scores = logits.transpose(0, 1)           # [E, N]
+        gate, idx = torch.topk(scores, cap, dim=-1)  # each expert picks top-C tokens
+        gate = torch.sigmoid(gate)                # [E, cap]
+        xe = x_flat[idx]                          # [E, cap, C]
+        w_fc = torch.stack([lin.weight for lin in self.c_fc])      # [E, hidden, C]
+        w_proj = torch.stack([lin.weight for lin in self.c_proj])  # [E, C, hidden]
+        h = torch.bmm(xe, w_fc.transpose(1, 2))   # [E, cap, hidden]
+        h = F.relu(h).square()
+        oe = torch.bmm(h, w_proj.transpose(1, 2)) # [E, cap, C]
+        oe = oe * gate.unsqueeze(-1)
+        out = torch.zeros(N, C, dtype=oe.dtype, device=oe.device)
+        out.index_add_(0, idx.reshape(-1), oe.reshape(-1, C))  # dropped tokens stay 0 (residual only)
+        return out.view(B, T, C)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MoEMLP(config) if layer_idx == config.n_layer - 1 else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
@@ -161,8 +198,15 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if isinstance(block.mlp, MoEMLP):
+                torch.nn.init.zeros_(block.mlp.router.weight)
+                for lin in block.mlp.c_fc:
+                    torch.nn.init.uniform_(lin.weight, -s, s)
+                for lin in block.mlp.c_proj:
+                    torch.nn.init.zeros_(lin.weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
