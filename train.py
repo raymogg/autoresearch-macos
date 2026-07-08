@@ -603,9 +603,13 @@ while True:
     model.zero_grad(set_to_none=True)
 
     # SWA: accumulate a uniform running average of weights across the plateau.
+    # Selective: only the Muon matrix params (transformer.h) oscillate (their
+    # spectral-norm-normalized updates never self-anneal near a basin), so only
+    # those benefit from centering. AdamW params (embeddings, lm_head, scalars)
+    # self-anneal with the plateau LR and are kept at their final trained value.
     if progress >= SWA_START:
         with torch.no_grad():
-            params = list(model.parameters())
+            params = list(model.transformer.h.parameters())
             if swa_params is None:
                 swa_params = [p.detach().float().clone() for p in params]
                 swa_count = 1
@@ -661,9 +665,9 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # so no restore is needed).
 if swa_params is not None:
     with torch.no_grad():
-        for p, avg in zip(model.parameters(), swa_params):
+        for p, avg in zip(model.transformer.h.parameters(), swa_params):
             p.copy_(avg.to(p.dtype))
-    print(f"Loaded SWA average over {swa_count} plateau steps")
+    print(f"Loaded SWA average over {swa_count} plateau steps (Muon matrix params only)")
 
 # Final eval
 model.eval()
