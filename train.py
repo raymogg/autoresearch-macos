@@ -273,7 +273,14 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, reduction='mean'):
         B, T = idx.size()
         assert T <= self.cos.size(1)
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        # Intra-row RoPE position reset at document boundaries (BOS): positions
+        # restart at 0 for each packed document so cross-doc query/key pairs get
+        # anomalous relative rotations, attenuating cross-document attention.
+        ar = torch.arange(T, device=idx.device)
+        is_bos = (idx == bos_token_id).to(ar.dtype)
+        seg_start = torch.cummax(ar * is_bos, dim=1).values
+        pos_ids = ar - seg_start  # (B, T)
+        cos_sin = self.cos[0, pos_ids], self.sin[0, pos_ids]  # (B, T, 1, d)
 
         x = self.transformer.wte(idx)
         x = norm(x)
