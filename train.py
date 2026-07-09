@@ -46,6 +46,11 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
+def token_shift(x):
+    # x[t] -> x[t-1] along the time dim, with position 0 zeroed (causal shift).
+    return F.pad(x, (0, 0, 1, 0))[:, :-1, :]
+
+
 def has_ve(layer_idx, n_layer):
     """Returns True if layer should have Value Embedding (alternating, last always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
@@ -117,9 +122,12 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, mu):
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        # RWKV-style token-shift on the MLP input only: per-channel blend of
+        # x[t] and x[t-1]. mu is zero-init so this is identity at step 0.
+        xs = x + mu * (token_shift(x) - x)
+        x = x + self.mlp(norm(xs))
         return x
 
 
@@ -135,6 +143,8 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # Per-layer, per-channel token-shift mix for the MLP branch (zero=identity).
+        self.mu_mlp = nn.Parameter(torch.zeros(config.n_layer, config.n_embd))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -166,6 +176,7 @@ class GPT(nn.Module):
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+        self.mu_mlp.zero_()
         # Value embeddings: embedding-scale init (std=1.0) to match wte and the
         # un-normed v-pathway RMS, not the transformer-matrix std (n_embd^-0.5).
         ve_bound = 3**0.5 * 1.4  # uniform(-sqrt(3)*1.4, +) has std 1.4
@@ -247,8 +258,10 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
+        mu_params = [self.mu_mlp]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
+            len(mu_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -258,6 +271,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=mu_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -281,7 +295,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            x = block(x, ve, cos_sin, self.window_sizes[i], self.mu_mlp[i])
         x = norm(x)
 
         softcap = 15
