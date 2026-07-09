@@ -76,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, cu_seqlens, max_seqlen):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -92,7 +92,16 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, softmax_scale=0.12, causal=True, window_size=window_size)
+        # Intra-document (block-diagonal) attention: flatten the batch and restrict
+        # each query to keys within its own document segment via cu_seqlens. The
+        # sliding window still applies, but only within a document.
+        q = q.reshape(B * T, self.n_head, self.head_dim)
+        k = k.reshape(B * T, self.n_kv_head, self.head_dim)
+        v = v.reshape(B * T, self.n_kv_head, self.head_dim)
+        y = fa3.flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+            softmax_scale=0.12, causal=True, window_size=window_size,
+        )
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -117,8 +126,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, window_size, cu_seqlens, max_seqlen):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, cu_seqlens, max_seqlen)
         x = x + self.mlp(norm(x))
         return x
 
@@ -270,10 +279,28 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    @torch._dynamo.disable
+    def _build_cu_seqlens(self, idx):
+        # Eager (dynamo-disabled) segment derivation: every packed row starts with
+        # BOS, so BOS positions are exactly the document boundaries. Marking the
+        # variable-length dim dynamic avoids per-step recompiles of the caller.
+        idx_flat = idx.reshape(-1)
+        bos_pos = torch.nonzero(idx_flat == self.bos_token_id, as_tuple=False).flatten()
+        total = idx_flat.numel()
+        cu_seqlens = torch.cat([bos_pos, bos_pos.new_full((1,), total)]).to(torch.int32)
+        torch._dynamo.mark_dynamic(cu_seqlens, 0)
+        return cu_seqlens
+
     def forward(self, idx, targets=None, reduction='mean'):
         B, T = idx.size()
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
+
+        # Build document segments (cu_seqlens) from BOS positions so attention is
+        # restricted to within-document keys. Computed eagerly (see helper) since
+        # the #docs is data-dependent.
+        cu_seqlens = self._build_cu_seqlens(idx)
+        max_seqlen = T
 
         x = self.transformer.wte(idx)
         x = norm(x)
@@ -281,7 +308,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            x = block(x, ve, cos_sin, self.window_sizes[i], cu_seqlens, max_seqlen)
         x = norm(x)
 
         softcap = 15
@@ -491,6 +518,7 @@ with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+model.bos_token_id = bos_token_id  # for intra-document attention segmentation
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
