@@ -73,6 +73,9 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # Hybrid global/local head split: 1 full-context global head, rest local.
+        self.n_global_head = 1
+        self.local_window = config.sequence_len // 16  # 128, matches old "S" window
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -92,7 +95,14 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, softmax_scale=0.12, causal=True, window_size=window_size)
+        # Per-head hybrid: first head attends full 2048 context (global),
+        # remaining heads use the local sliding window. Two FA3 calls, concat.
+        ng = self.n_global_head
+        yg = fa3.flash_attn_func(q[:, :, :ng], k[:, :, :ng], v[:, :, :ng],
+                                 softmax_scale=0.12, causal=True, window_size=(-1, -1))
+        yl = fa3.flash_attn_func(q[:, :, ng:], k[:, :, ng:], v[:, :, ng:],
+                                 softmax_scale=0.12, causal=True, window_size=(self.local_window, 0))
+        y = torch.cat([yg, yl], dim=2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
