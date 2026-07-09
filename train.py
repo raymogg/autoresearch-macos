@@ -74,6 +74,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.gate = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.v_gate = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -82,6 +83,11 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Per-source-token input-dependent value gate (before SDPA): each token
+        # modulates its own value contribution inside the attention weighted-sum.
+        # 2*sigmoid(0)=1.0 with zero-init weight => step-0 bit-identical to baseline.
+        v = 2 * torch.sigmoid(self.v_gate(x)).view(B, T, self.n_kv_head, self.head_dim) * v
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
@@ -166,6 +172,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.zeros_(block.attn.gate.weight)
+            torch.nn.init.zeros_(block.attn.v_gate.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         # Per-layer scalars
