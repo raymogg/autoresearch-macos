@@ -46,6 +46,12 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
+def token_shift(x):
+    # RWKV-style causal shift by one position along the time dim (previous
+    # token), with the first position zeroed. x: (B, T, C).
+    return F.pad(x, (0, 0, 1, 0))[:, :-1, :]
+
+
 def has_ve(layer_idx, n_layer):
     """Returns True if layer should have Value Embedding (alternating, last always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
@@ -116,10 +122,19 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        # RWKV-style token-shift: per-channel blend of x[t] and x[t-1], one
+        # vector for the attention input and one for the MLP input. Zero-init
+        # (see init_weights) => identity => bit-identical to baseline at step 0.
+        self.mu_attn = nn.Parameter(torch.zeros(config.n_embd))
+        self.mu_mlp = nn.Parameter(torch.zeros(config.n_embd))
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        xa = norm(x)
+        xa = xa + (token_shift(xa) - xa) * self.mu_attn
+        x = x + self.attn(xa, ve, cos_sin, window_size)
+        xm = norm(x)
+        xm = xm + (token_shift(xm) - xm) * self.mu_mlp
+        x = x + self.mlp(xm)
         return x
 
 
@@ -163,6 +178,9 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            # Token-shift mixing vectors: zero => identity (no shift) at init.
+            torch.nn.init.zeros_(block.mu_attn)
+            torch.nn.init.zeros_(block.mu_mlp)
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
@@ -241,14 +259,19 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        # Token-shift mixing vectors are 1D; keep them out of the Muon (2D-matrix)
+        # group and train them with AdamW alongside the other scalars/vectors.
+        tokenshift_params = [p for block in self.transformer.h
+                             for p in (block.mu_attn, block.mu_mlp)]
+        matrix_params = [p for p in self.transformer.h.parameters() if p.ndim == 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
+            len(x0_params) + len(tokenshift_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -258,6 +281,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=tokenshift_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
