@@ -93,6 +93,7 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)
 
         y = fa3.flash_attn_func(q, k, v, softmax_scale=0.12, causal=True, window_size=window_size)
+        y = norm(y)  # per-head RMS norm over head_dim: equalize cross-head output magnitudes
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
