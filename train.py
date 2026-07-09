@@ -75,6 +75,8 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Learnable per-layer attention sink logit (generalizes softmax / quiet-attention).
+        self.attn_sink = nn.Parameter(torch.zeros(1))
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -92,7 +94,10 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, softmax_scale=0.12, causal=True, window_size=window_size)
+        y, lse = fa3.flash_attn_func(q, k, v, softmax_scale=0.12, causal=True, window_size=window_size, return_attn_probs=True)
+        # Learnable per-layer attention sink: rescale by D/(D+exp(b)) = sigmoid(lse - b),
+        # where D=exp(lse). lse is (B, H, T); init b=-8 => sigmoid(lse+8) ~ 1 = standard softmax.
+        y = y * torch.sigmoid(lse.transpose(1, 2).unsqueeze(-1) - self.attn_sink).to(y.dtype)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -166,6 +171,9 @@ class GPT(nn.Module):
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+        # Attention sink logits: init strongly negative so init exactly recovers standard softmax.
+        for block in self.transformer.h:
+            block.attn.attn_sink.fill_(-8.0)
         # Value embeddings: embedding-scale init (std=1.0) to match wte and the
         # un-normed v-pathway RMS, not the transformer-matrix std (n_embd^-0.5).
         ve_bound = 3**0.5 * 1.4  # uniform(-sqrt(3)*1.4, +) has std 1.4
@@ -241,13 +249,14 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = [p for n, p in self.transformer.h.named_parameters() if 'attn_sink' not in n]
+        sink_params = [p for n, p in self.transformer.h.named_parameters() if 'attn_sink' in n]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+        assert len(list(self.parameters())) == (len(matrix_params) + len(sink_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -258,6 +267,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=sink_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
