@@ -135,6 +135,10 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # Depthwise causal conv1d (k=3) for cheap local n-gram mixing of the
+        # input embedding; identity-initialized (see init_weights) so step-0 is
+        # bit-identical to baseline.
+        self.token_conv = nn.Parameter(torch.zeros(config.n_embd, 1, 3))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -166,6 +170,10 @@ class GPT(nn.Module):
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+        # Identity init for depthwise causal conv: only the current-token tap
+        # (rightmost, aligned to position t after left-pad) is 1.0.
+        self.token_conv.zero_()
+        self.token_conv[:, :, -1] = 1.0
         # Value embeddings: embedding-scale init (std=1.0) to match wte and the
         # un-normed v-pathway RMS, not the transformer-matrix std (n_embd^-0.5).
         ve_bound = 3**0.5 * 1.4  # uniform(-sqrt(3)*1.4, +) has std 1.4
@@ -247,8 +255,10 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
+        conv_params = [self.token_conv]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
+            len(conv_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -258,6 +268,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=conv_params, lr=0.01 * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -277,6 +288,11 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
+        # Depthwise causal conv1d (k=3): cheap local trigram mixing applied once
+        # to the input embedding, reaching every layer (incl. mixing-free MLPs)
+        # via the x0 shortcut. Identity-initialized -> bit-identical at step 0.
+        xc = F.pad(x.transpose(1, 2), (2, 0))
+        x = F.conv1d(xc, self.token_conv, groups=self.config.n_embd).transpose(1, 2)
         x0 = x
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
