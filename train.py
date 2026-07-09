@@ -76,6 +76,13 @@ class CausalSelfAttention(nn.Module):
         self.gate = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Persistent learned memory: per-head bank of R non-token-derived key/value
+        # "register" vectors that every query can attend to (all-attention style).
+        # reg_gate is zero-init so step-0 output is bit-identical to baseline.
+        self.n_reg = 16
+        self.reg_k = nn.Parameter(torch.zeros(self.n_head, self.n_reg, self.head_dim))
+        self.reg_v = nn.Parameter(torch.zeros(self.n_head, self.n_reg, self.head_dim))
+        self.reg_gate = nn.Parameter(torch.zeros(()))
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -94,6 +101,11 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)
 
         y = fa3.flash_attn_func(q, k, v, softmax_scale=0.12, causal=True, window_size=window_size)
+        # Persistent memory: separate softmax over the R learned registers per head.
+        reg_scores = torch.einsum('bthd,hrd->bthr', q, self.reg_k) * 0.12
+        reg_attn = reg_scores.softmax(dim=-1)
+        y_reg = torch.einsum('bthr,hrd->bthd', reg_attn, self.reg_v)
+        y = y + self.reg_gate * y_reg
         y = y.contiguous().view(B, T, -1)
         # Per-channel input-dependent output gate (Qwen-style gated attention).
         # 2*sigmoid(0)=1.0 with zero-init weight => step-0 bit-identical to baseline.
@@ -180,6 +192,12 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # Persistent memory registers: nonzero-init keys/values (so gradients can
+        # flow) but zero-init reg_gate -> step-0 output is bit-identical to baseline.
+        for block in self.transformer.h:
+            torch.nn.init.normal_(block.attn.reg_k, mean=0.0, std=0.5)
+            torch.nn.init.normal_(block.attn.reg_v, mean=0.0, std=0.5)
+            torch.nn.init.zeros_(block.attn.reg_gate)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -246,14 +264,23 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        # Persistent memory register params are routed to AdamW (not Muon).
+        reg_kv_params, reg_gate_params, reg_ids = [], [], set()
+        for block in self.transformer.h:
+            for p in (block.attn.reg_k, block.attn.reg_v):
+                reg_kv_params.append(p)
+                reg_ids.add(id(p))
+            reg_gate_params.append(block.attn.reg_gate)
+            reg_ids.add(id(block.attn.reg_gate))
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in reg_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) +
+            len(reg_kv_params) + len(reg_gate_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -263,6 +290,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=reg_kv_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=reg_gate_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
