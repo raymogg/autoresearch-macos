@@ -84,7 +84,11 @@ class CausalSelfAttention(nn.Module):
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            # VE tables are kept at full n_head width; pair-sum adjacent head
+            # groups down into the n_kv_head KV heads (GQA), preserving all VE
+            # params/gradient density while decoupling from the KV-head count.
+            group = self.n_head // self.n_kv_head
+            ve = ve.view(B, T, self.n_kv_head, group, self.head_dim).sum(3)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
 
@@ -92,6 +96,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
+        v = v.to(q.dtype)  # pair-sum VE add can promote v; FA3 needs matching q/k/v dtype
         y = fa3.flash_attn_func(q, k, v, softmax_scale=0.12, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -137,7 +142,9 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
         head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
+        # Keep VE tables at full n_head width; they are pair-summed into the
+        # n_kv_head KV heads at use-time (GQA), so no VE capacity is lost.
+        kv_dim = config.n_head * head_dim
         self.value_embeds = nn.ModuleDict({
             str(i): nn.Embedding(config.vocab_size, kv_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
@@ -480,7 +487,7 @@ def build_model_config(depth):
     num_heads = model_dim // HEAD_DIM
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_heads // 2, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )
 
